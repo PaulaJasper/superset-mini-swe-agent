@@ -1,0 +1,108 @@
+# Python unit tests
+name: Python-Unit
+
+# Least-privilege default for GITHUB_TOKEN. Jobs that need more (e.g. OIDC for
+# codecov uploads) opt in via their own job-level `permissions:` block.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - "master"
+      - "[0-9].[0-9]*"
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+
+# cancel previous workflow jobs for PRs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Detect Python changes
+        id: change-detector
+        uses: ./.github/actions/change-detector
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      python: ${{ steps.change-detector.outputs.python }}
+
+  unit-tests:
+    needs: changes
+    if: needs.changes.result == 'success' && needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["current"]') || fromJSON('["current", "next"]') }}
+    env:
+      SUPERSET_ENV: testing
+      SUPERSET_SECRET_KEY: dummy_secret_key_for_test_to_silence_warnings
+      SUPERSET__SQLALCHEMY_DATABASE_URI: "sqlite://"
+      PYTHONPATH: ${{ github.workspace }}
+      SQLALCHEMY_WARN_20: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Setup backend for Python ${{ matrix.python-version }}
+        uses: ./.github/actions/setup-backend
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run unit tests with coverage
+        run: |
+          pytest \
+            --cov=superset \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            tests/unit_tests
+      - name: Run SQL unit tests with full coverage
+        run: |
+          pytest \
+            --cov=superset/sql \
+            --cov-report=term-missing \
+            --cov-fail-under=100 \
+            tests/unit_tests/sql
+      - name: Run semantic layer unit tests with full coverage
+        run: |
+          pytest \
+            --cov=superset/semantic_layers \
+            --cov-report=term-missing \
+            --cov-fail-under=100 \
+            tests/unit_tests/semantic_layers
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          slug: ${{ github.repository }}
+          files: ./coverage.xml
+          flags: python-unit-tests
+          name: python-unit-tests
+          fail_ci_if_error: true
+          use_oidc: true
+
+  unit-tests-required:
+    needs:
+      - changes
+      - unit-tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check unit tests result
+        run: |
+          result="${{ needs.unit-tests.result }}"
+          echo "unit-tests result: $result"
+          if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+            echo "::error::unit-tests must succeed or be skipped; got: $result"
+            exit 1
+          fi
