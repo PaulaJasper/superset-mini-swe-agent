@@ -1,0 +1,194 @@
+# Python Presto/Hive unit tests
+name: Python Presto/Hive
+
+on:
+  push:
+    branches:
+      - "master"
+      - "[0-9].[0-9]*"
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+
+# cancel previous workflow jobs for PRs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      python: ${{ steps.change-detector.outputs.python }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Detect Python changes
+        id: change-detector
+        uses: ./.github/actions/change-detector
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  test-postgres-presto:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: superset
+          POSTGRES_PASSWORD: superset
+          POSTGRES_DB: superset
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U superset"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      presto:
+        image: starburstdata/presto:350-e.6
+        ports:
+          - 15433:15433
+      redis:
+        image: redis:7
+        ports:
+          - 16379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      SUPERSET_CONFIG: tests.integration_tests.superset_test_config
+      SUPERSET__SQLALCHEMY_DATABASE_URI: postgresql://superset:superset@127.0.0.1:15432/superset
+      SUPERSET__SQLALCHEMY_EXAMPLES_URI: presto://localhost:15433/memory/default
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 16379
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python backend
+        uses: ./.github/actions/setup-backend
+        with:
+          python-version: current
+      - name: Setup PostgreSQL
+        run: |
+          source .github/workflows/bashlib.sh
+          set -e
+          setup-postgres
+      - name: Initialize Superset metadata database
+        run: |
+          set -e
+          superset db upgrade
+          superset init
+          superset load-test-users
+      - name: Start Celery worker
+        run: |
+          source .github/workflows/bashlib.sh
+          set -e
+          celery-worker
+      - name: Run chartData and SQL JSON tests
+        run: |
+          pytest --cov=superset --cov-report=xml \
+            -m "chart_data_flow or sql_json_flow" \
+            tests/integration_tests/charts/data/api_tests.py \
+            tests/integration_tests/sqllab_tests.py
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          flags: python,presto
+          use_oidc: true
+
+  test-postgres-hive:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: superset
+          POSTGRES_PASSWORD: superset
+          POSTGRES_DB: superset
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U superset"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 16379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      SUPERSET_CONFIG: tests.integration_tests.superset_test_config
+      SUPERSET__SQLALCHEMY_DATABASE_URI: postgresql://superset:superset@127.0.0.1:15432/superset
+      SUPERSET__SQLALCHEMY_EXAMPLES_URI: hive://localhost:10000/default
+      UPLOAD_FOLDER: /tmp/superset_uploads
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 16379
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Hive
+        run: |
+          set -e
+          mkdir -p /tmp/superset_uploads
+          sudo chown -R "$(id -u):$(id -g)" /tmp/superset_uploads
+          chmod -R u+rwx /tmp/superset_uploads
+          docker compose -f scripts/databases/hive/docker-compose.yml up -d
+      - name: Setup Python backend
+        uses: ./.github/actions/setup-backend
+        with:
+          python-version: current
+      - name: Setup PostgreSQL
+        run: |
+          source .github/workflows/bashlib.sh
+          set -e
+          setup-postgres
+      - name: Initialize Superset metadata database
+        run: |
+          set -e
+          superset db upgrade
+          superset init
+          superset load-test-users
+      - name: Install Hive dependencies
+        run: |
+          uv pip install --system -e ".[hive]"
+      - name: Start Celery worker
+        run: |
+          source .github/workflows/bashlib.sh
+          set -e
+          celery-worker
+      - name: Run chartData and SQL JSON tests
+        run: |
+          pytest --cov=superset --cov-report=xml \
+            -m "chart_data_flow or sql_json_flow" \
+            tests/integration_tests/charts/data/api_tests.py \
+            tests/integration_tests/sqllab_tests.py
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          flags: python,hive
+          use_oidc: true
