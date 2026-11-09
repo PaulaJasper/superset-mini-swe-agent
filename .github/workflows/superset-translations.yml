@@ -1,0 +1,124 @@
+name: Translations
+
+on:
+  push:
+    branches:
+      - "master"
+      - "[0-9].[0-9]*"
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# cancel previous workflow jobs for PRs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+
+jobs:
+  frontend-check-translations:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Detect changed files
+        id: changes
+        uses: ./.github/actions/change-detector
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Node.js
+        if: ${{ steps.changes.outputs.frontend }}
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: superset-frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: superset-frontend/package-lock.json
+      - name: Install frontend dependencies
+        if: ${{ steps.changes.outputs.frontend }}
+        working-directory: superset-frontend
+        run: npm ci
+      - name: Check frontend translation build
+        if: ${{ steps.changes.outputs.frontend }}
+        working-directory: superset-frontend
+        run: npm run build-translation
+
+  babel-extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect changed files
+        id: changes
+        uses: ./.github/actions/change-detector
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Python
+        if: ${{ steps.changes.outputs.python == 'true' || steps.changes.outputs.frontend == 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install translation dependencies
+        if: ${{ steps.changes.outputs.python == 'true' || steps.changes.outputs.frontend == 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gettext
+          python -m pip install --upgrade pip
+          python -m pip install -r superset/translations/requirements.txt
+      - name: Create baseline worktree
+        if: ${{ steps.changes.outputs.python == 'true' || steps.changes.outputs.frontend == 'true' }}
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BASE_REF}" ]; then
+            git fetch origin "${BASE_REF}"
+          else
+            git fetch origin "${EVENT_REF}"
+          fi
+          BASELINE_SHA="$(git rev-parse FETCH_HEAD)"
+          git worktree add --detach "${{ runner.temp }}/superset-translations-baseline" "${BASELINE_SHA}"
+      - name: Update baseline translations
+        if: ${{ steps.changes.outputs.python == 'true' || steps.changes.outputs.frontend == 'true' }}
+        working-directory: ${{ runner.temp }}/superset-translations-baseline
+        run: ./scripts/translations/babel_update.sh
+      - name: Record baseline translation counts
+        if: ${{ steps.changes.outputs.python == 'true' || steps.changes.outputs.frontend == 'true' }}
+        run: |
+          python scripts/translations/check_translation_regression.py \
+            --count \
+            --translations-dir "${{ runner.temp }}/superset-translations-baseline/superset/translations" \
+            > "${{ runner.temp }}/translation-baseline.json"
+      - name: Update current translations
+        if: ${{ steps.changes.outputs.python == 'true' || steps.changes.outputs.frontend == 'true' }}
+        run: ./scripts/translations/babel_update.sh
+      - name: Compare current translations with baseline
+        id: compare_translations
+        if: ${{ steps.changes.outputs.python == 'true' || steps.changes.outputs.frontend == 'true' }}
+        continue-on-error: true
+        run: |
+          python scripts/translations/check_translation_regression.py \
+            --compare "${{ runner.temp }}/translation-baseline.json" \
+            --report translation-regression-report.md
+      - name: Save pull request number
+        if: ${{ github.event_name == 'pull_request' && steps.compare_translations.outcome == 'failure' }}
+        run: echo "${{ github.event.pull_request.number }}" > pr_number.txt
+      - name: Upload translation regression report
+        if: ${{ github.event_name == 'pull_request' && steps.compare_translations.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: translation-regression-report
+          path: |
+            translation-regression-report.md
+            pr_number.txt
+          if-no-files-found: error
+      - name: Fail on translation regression
+        if: ${{ steps.compare_translations.outcome == 'failure' }}
+        run: |
+          echo "Translation regression check failed. See the regression report artifact for details."
+          exit 1
