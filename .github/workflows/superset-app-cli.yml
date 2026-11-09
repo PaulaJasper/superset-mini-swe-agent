@@ -1,0 +1,86 @@
+name: Superset App CLI tests
+
+on:
+  push:
+    branches:
+      - "master"
+      - "[0-9].[0-9]*"
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# cancel previous workflow jobs for PRs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+
+jobs:
+  test-load-examples:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: superset
+          POSTGRES_PASSWORD: superset
+          POSTGRES_DB: superset
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U superset -d superset"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PYTHONPATH: .
+      SUPERSET_CONFIG: tests.integration_tests.superset_test_config
+      SUPERSET_TESTENV: "true"
+      SUPERSET__SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://superset:superset@localhost:5433/superset
+      SUPERSET__SQLALCHEMY_EXAMPLES_URI: postgresql+psycopg2://superset:superset@localhost:5433/superset
+      REDIS_HOST: localhost
+      REDIS_PORT: "6380"
+    steps:
+      - name: Checkout code and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Detect file changes
+        id: change-detector
+        uses: ./.github/actions/change-detector
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up backend
+        if: steps.change-detector.outputs.python
+        uses: ./.github/actions/setup-backend
+        with:
+          python-version: "3.11"
+          requirements-type: dev
+          install-superset: "true"
+      - name: Set up PostgreSQL client
+        if: steps.change-detector.outputs.python
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+      - name: Initialize Superset and load test users
+        if: steps.change-detector.outputs.python
+        run: |
+          superset db upgrade
+          superset init
+          superset load-test-users
+      - name: Load examples with big data
+        if: steps.change-detector.outputs.python
+        run: |
+          superset load-examples --load-big-data
