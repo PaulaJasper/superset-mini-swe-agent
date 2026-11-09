@@ -1,0 +1,73 @@
+name: Superset Extensions CLI Package Tests
+
+on:
+  push:
+    branches:
+      - "master"
+      - "[0-9].[0-9]*"
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# cancel previous workflow jobs for PRs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+
+jobs:
+  test-superset-extensions-cli-package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version:
+          - current
+          - next
+    if: ${{ github.event_name != 'pull_request' || matrix.python-version == 'current' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Detect file changes
+        id: change-detector
+        uses: ./.github/actions/change-detector
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        if: ${{ success() && steps.change-detector.outputs.superset-extensions-cli != '' }}
+        uses: ./.github/actions/setup-backend
+        with:
+          python-version: ${{ matrix.python-version }}
+          requirements-type: dev
+
+      - name: Run extension CLI package tests
+        if: ${{ success() && steps.change-detector.outputs.superset-extensions-cli != '' }}
+        working-directory: superset-extensions-cli
+        run: |
+          pytest \
+            --cov=superset_extensions_cli \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --cov-report=html
+
+      - name: Upload coverage to Codecov
+        if: ${{ success() && steps.change-detector.outputs.superset-extensions-cli != '' }}
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          flags: superset-extensions-cli
+          fail_ci_if_error: false
+
+      - name: Upload HTML coverage report
+        if: ${{ success() && steps.change-detector.outputs.superset-extensions-cli != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-coverage-report
+          path: htmlcov/
