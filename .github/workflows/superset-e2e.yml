@@ -1,0 +1,347 @@
+name: E2E
+
+on:
+  push:
+    branches:
+      - "master"
+      - "[0-9].[0-9]*"
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      use_dashboard:
+        description: "Use Cypress Dashboard (true/false) [paid service - trigger manually when needed]. You MUST provide a branch and/or PR number below for this to work."
+        required: false
+        default: "false"
+      ref:
+        description: "The branch or tag to checkout"
+        required: false
+        default: ""
+      pr_id:
+        description: "The pull request ID to checkout"
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      python: ${{ steps.changes.outputs.python }}
+      frontend: ${{ steps.changes.outputs.frontend }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Detect changed files
+        id: changes
+        uses: ./.github/actions/change-detector
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  cypress-matrix:
+    needs: changes
+    if: >
+      (needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.frontend == 'true') &&
+      github.event.pull_request.draft != true
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      pull-requests: read
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chrome]
+        parallel_id: [0, 1]
+        parallelism: [2]
+        app_root: "${{ github.event_name == 'push' && fromJSON('[\"\", \"/app\"]') || fromJSON('[\"\"]') }}"
+        exclude:
+          - app_root: "/app"
+            parallel_id: 1
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PYTHONPATH: ${{ github.workspace }}
+      SUPERSET_ENV: development
+      SUPERSET_CONFIG: tests.integration_tests.superset_test_config
+      SUPERSET__SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://superset:superset@127.0.0.1:15432/superset
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: superset
+          POSTGRES_PASSWORD: superset
+          POSTGRES_DB: superset
+        ports:
+          - "15432:5432"
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout branch or tag
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.ref != ''
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref }}
+          submodules: recursive
+      - name: Checkout pull request merge commit
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.pr_id != ''
+        uses: actions/checkout@v6
+        with:
+          ref: refs/pull/${{ github.event.inputs.pr_id }}/merge
+          submodules: recursive
+      - name: Checkout code
+        if: github.event_name != 'workflow_dispatch'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          submodules: recursive
+      - name: Set up backend
+        uses: ./.github/actions/setup-backend
+        with:
+          python-version: current
+      - name: Prepare Postgres schemas
+        run: |
+          source .github/workflows/bashlib.sh
+          setup-postgres
+      - name: Load Cypress test data
+        run: |
+          source .github/workflows/bashlib.sh
+          testdata
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: superset-frontend/.nvmrc
+      - name: Install frontend dependencies
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: npm-install
+      - name: Build instrumented frontend assets
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: build-instrumented-assets
+      - name: Install Cypress
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: cypress-install
+      - name: Run Cypress tests
+        env:
+          CYPRESS_RECORD_KEY: ${{ secrets.CYPRESS_RECORD_KEY }}
+          CYPRESS_BROWSER: ${{ matrix.browser }}
+          USE_DASHBOARD: ${{ github.event.inputs.use_dashboard }}
+          APP_ROOT: ${{ matrix.app_root }}
+          PARALLELISM: ${{ matrix.parallelism }}
+          PARALLEL_ID: ${{ matrix.parallel_id }}
+        run: |
+          source .github/workflows/bashlib.sh
+          cypress-run-all "$USE_DASHBOARD" "$APP_ROOT"
+      - name: Upload Cypress screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cypress-screenshots-${{ github.run_id }}-${{ github.job }}-${{ matrix.browser }}-shard-${{ matrix.parallel_id }}-${{ matrix.app_root == '' && 'root' || 'prefixed' }}
+          path: superset-frontend/cypress-base/cypress/screenshots
+          if-no-files-found: ignore
+          retention-days: 7
+
+  playwright-tests:
+    needs: changes
+    if: >
+      needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium]
+        app_root: "${{ github.event_name == 'push' && fromJSON('[\"\", \"/app\"]') || fromJSON('[\"\"]') }}"
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PYTHONPATH: ${{ github.workspace }}
+      SUPERSET_ENV: development
+      SUPERSET_CONFIG: tests.integration_tests.superset_test_config
+      SUPERSET__SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://superset:superset@127.0.0.1:15432/superset
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: superset
+          POSTGRES_PASSWORD: superset
+          POSTGRES_DB: superset
+        ports:
+          - "15432:5432"
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout branch or tag
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.ref != ''
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref }}
+          submodules: recursive
+      - name: Checkout pull request merge commit
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.pr_id != ''
+        uses: actions/checkout@v6
+        with:
+          ref: refs/pull/${{ github.event.inputs.pr_id }}/merge
+          submodules: recursive
+      - name: Checkout code
+        if: github.event_name != 'workflow_dispatch'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          submodules: recursive
+      - name: Set up backend
+        uses: ./.github/actions/setup-backend
+        with:
+          python-version: current
+      - name: Prepare Postgres schemas
+        run: |
+          source .github/workflows/bashlib.sh
+          setup-postgres
+      - name: Load Playwright test data
+        run: |
+          source .github/workflows/bashlib.sh
+          playwright_testdata
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: superset-frontend/.nvmrc
+      - name: Install frontend dependencies
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: npm-install
+      - name: Build instrumented frontend assets
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: build-instrumented-assets
+      - name: Build embedded SDK
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: build-embedded-sdk
+      - name: Install Playwright
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: playwright-install
+      - name: Run Playwright tests
+        env:
+          APP_ROOT: ${{ matrix.app_root }}
+        run: |
+          source .github/workflows/bashlib.sh
+          playwright-run "$APP_ROOT"
+      - name: Upload Playwright results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results-${{ github.run_id }}-${{ github.job }}-${{ matrix.browser }}-${{ matrix.app_root == '' && 'root' || 'prefixed' }}
+          path: |
+            superset-frontend/playwright-results
+            superset-frontend/test-results
+          if-no-files-found: ignore
+          retention-days: 7
+
+  cypress-matrix-required:
+    if: always()
+    needs:
+      - changes
+      - cypress-matrix
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      changes_result: ${{ steps.check.outputs.changes_result }}
+      tests_result: ${{ steps.check.outputs.tests_result }}
+      gate_result: ${{ steps.check.outputs.gate_result }}
+    steps:
+      - name: Check Cypress required status
+        id: check
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          TESTS_RESULT: ${{ needs.cypress-matrix.result }}
+        run: |
+          set -euo pipefail
+          echo "changes result: ${CHANGES_RESULT}"
+          echo "cypress-matrix result: ${TESTS_RESULT}"
+          echo "changes_result=${CHANGES_RESULT}" >> "$GITHUB_OUTPUT"
+          echo "tests_result=${TESTS_RESULT}" >> "$GITHUB_OUTPUT"
+          if [ "${CHANGES_RESULT}" != "success" ]; then
+            echo "::error::changes did not succeed: ${CHANGES_RESULT}"
+            echo "gate_result=failure" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [ "${TESTS_RESULT}" != "success" ] && [ "${TESTS_RESULT}" != "skipped" ]; then
+            echo "::error::cypress-matrix did not succeed or skip: ${TESTS_RESULT}"
+            echo "gate_result=failure" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "gate_result=success" >> "$GITHUB_OUTPUT"
+
+  playwright-tests-required:
+    if: always()
+    needs:
+      - changes
+      - playwright-tests
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      changes_result: ${{ steps.check.outputs.changes_result }}
+      tests_result: ${{ steps.check.outputs.tests_result }}
+      gate_result: ${{ steps.check.outputs.gate_result }}
+    steps:
+      - name: Check Playwright required status
+        id: check
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          TESTS_RESULT: ${{ needs.playwright-tests.result }}
+        run: |
+          set -euo pipefail
+          echo "changes result: ${CHANGES_RESULT}"
+          echo "playwright-tests result: ${TESTS_RESULT}"
+          echo "changes_result=${CHANGES_RESULT}" >> "$GITHUB_OUTPUT"
+          echo "tests_result=${TESTS_RESULT}" >> "$GITHUB_OUTPUT"
+          if [ "${CHANGES_RESULT}" != "success" ]; then
+            echo "::error::changes did not succeed: ${CHANGES_RESULT}"
+            echo "gate_result=failure" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [ "${TESTS_RESULT}" != "success" ] && [ "${TESTS_RESULT}" != "skipped" ]; then
+            echo "::error::playwright-tests did not succeed or skip: ${TESTS_RESULT}"
+            echo "gate_result=failure" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "gate_result=success" >> "$GITHUB_OUTPUT"
