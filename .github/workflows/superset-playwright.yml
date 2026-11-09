@@ -1,0 +1,185 @@
+name: Playwright Experimental Tests
+
+on:
+  push:
+    branches:
+      - "master"
+      - "[0-9].[0-9]*"
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "The branch or tag to checkout"
+        required: false
+        default: ""
+      pr_id:
+        description: "The pull request ID to checkout"
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      python: ${{ steps.change-detector.outputs.python }}
+      frontend: ${{ steps.change-detector.outputs.frontend }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Detect changed file groups
+        id: change-detector
+        uses: ./.github/actions/change-detector
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  playwright-tests-experimental:
+    needs: changes
+    if: ${{ needs.changes.result == 'success' && (needs.changes.outputs.python == 'true' || needs.changes.outputs.frontend == 'true') }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: read
+    strategy:
+      fail-fast: false
+      matrix:
+        browser:
+          - chromium
+        app_root:
+          - ""
+          - "/superset"
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: superset
+          POSTGRES_PASSWORD: superset
+          POSTGRES_DB: superset
+        ports:
+          - "15432:5432"
+        options: >-
+          --health-cmd "pg_isready -U superset"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SUPERSET_CONFIG: tests.integration_tests.superset_test_config
+      SUPERSET_ENV: development
+      SUPERSET__SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://superset:superset@127.0.0.1:15432/superset
+      SUPERSET__SQLALCHEMY_EXAMPLES_URI: postgresql+psycopg2://superset:superset@127.0.0.1:15432/superset
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+    steps:
+      - name: Checkout push commit or pull request head
+        if: github.event_name != 'workflow_dispatch'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Checkout target ref for manual run
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.ref != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Checkout pull request merge ref for manual run
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.pr_id != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/pull/${{ github.event.inputs.pr_id }}/merge
+
+      - name: Set up Python backend
+        uses: ./.github/actions/setup-backend
+        with:
+          python-version: "3.11"
+          requirements-type: development
+          install-superset: "true"
+
+      - name: Initialize PostgreSQL
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: setup-postgres
+
+      - name: Import Playwright test data
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: playwright_testdata
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: superset-frontend/package.json
+          cache: npm
+          cache-dependency-path: superset-frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: npm-install
+
+      - name: Build instrumented frontend assets
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: build-instrumented-assets
+
+      - name: Build embedded SDK
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: build-embedded-sdk
+
+      - name: Install Playwright browsers
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: playwright-install
+
+      - name: Run experimental Playwright tests
+        uses: ./.github/actions/cached-dependencies
+        with:
+          run: playwright-run "${{ matrix.app_root }}" experimental/
+
+      - name: Run embedded Playwright tests
+        if: success()
+        uses: ./.github/actions/cached-dependencies
+        env:
+          INCLUDE_EMBEDDED: "true"
+        with:
+          run: playwright-run "${{ matrix.app_root }}" embedded/
+
+      - name: Prepare artifact suffix
+        if: failure()
+        id: artifact-suffix
+        env:
+          APP_ROOT: ${{ matrix.app_root }}
+        run: |
+          app_root_slug=$(printf '%s' "$APP_ROOT" | sed -e 's#^/##' -e 's#/#-#g' -e 's#[^A-Za-z0-9._-]#-#g')
+          echo "app_root=${app_root_slug:-root}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Playwright results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-${{ github.run_id }}-${{ github.job }}-${{ matrix.browser }}-${{ steps.artifact-suffix.outputs.app_root }}
+          path: |
+            superset-frontend/playwright-results/
+            superset-frontend/test-results/
+          if-no-files-found: ignore
