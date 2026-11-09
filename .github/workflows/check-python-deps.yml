@@ -1,0 +1,75 @@
+name: Check python dependencies
+
+on:
+  push:
+    branches:
+      - "master"
+      - "[0-9].[0-9]*"
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# cancel previous workflow jobs for PRs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+
+jobs:
+  check-python-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Detect file changes
+        id: change-detector
+        uses: ./.github/actions/change-detector
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        if: steps.change-detector.outputs.python
+        uses: ./.github/actions/setup-backend
+        with:
+          install-superset: "false"
+
+      - name: Try to login to DockerHub
+        if: steps.change-detector.outputs.python
+        continue-on-error: true
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate Python dependencies
+        if: steps.change-detector.outputs.python
+        run: ./scripts/uv-pip-compile.sh
+
+      - name: Check for dependency drift
+        if: steps.change-detector.outputs.python
+        run: |
+          git diff > /tmp/python-deps-full.diff
+
+          echo "::group::Full diff"
+          cat /tmp/python-deps-full.diff
+          echo "::endgroup::"
+
+          grep -E '^[+-]' /tmp/python-deps-full.diff \
+            | grep -vE '^(---|\+\+\+)' \
+            | grep -vE '^[+-][[:space:]]*#' \
+            | grep -vE '^[+-][[:space:]]*$' \
+            > /tmp/python-deps-filtered.diff || true
+
+          echo "::group::Filtered diff"
+          cat /tmp/python-deps-filtered.diff
+          echo "::endgroup::"
+
+          if [ -s /tmp/python-deps-filtered.diff ]; then
+            echo "::error::Pinned Python dependencies are out of date."
+            echo "Run ./scripts/uv-pip-compile.sh and commit the generated changes."
+            exit 1
+          fi
