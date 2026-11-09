@@ -1,0 +1,183 @@
+name: "Frontend Build CI (unit tests, linting & sanity checks)"
+
+on:
+  push:
+    branches:
+      - "master"
+      - "[0-9].[0-9]*"
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+
+# cancel previous workflow jobs for PRs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  TAG: apache/superset:GHA-${{ github.run_id }}
+
+permissions:
+  contents: read
+
+
+jobs:
+  frontend-build:
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.check.outputs.frontend }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Detect frontend changes
+        id: check
+        uses: ./.github/actions/change-detector
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup Docker
+        if: ${{ steps.check.outputs.frontend }}
+        uses: ./.github/actions/setup-docker
+        with:
+          build: true
+          dockerhub-user: ${{ secrets.DOCKERHUB_USER }}
+          dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build frontend CI image
+        if: ${{ steps.check.outputs.frontend }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker buildx build \
+            --target superset-node-ci \
+            --cache-from type=registry,ref=apache/superset:superset-node-ci \
+            --tag "${{ env.TAG }}" \
+            --load \
+            .
+      - name: Export frontend CI image
+        if: ${{ steps.check.outputs.frontend }}
+        run: |
+          docker save "${{ env.TAG }}" | zstd -T0 -o frontend-build.tar.zst
+      - name: Upload frontend CI image
+        if: ${{ steps.check.outputs.frontend }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend-build.tar.zst
+
+  sharded-jest-tests:
+    needs: frontend-build
+    if: ${{ needs.frontend-build.outputs.should-run == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Download frontend CI image
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+      - name: Load frontend CI image
+        run: zstd -d frontend-build.tar.zst -c | docker load
+      - name: Run Jest shard
+        run: |
+          mkdir -p coverage
+          docker run --rm \
+            -v "${{ github.workspace }}/coverage:/app/superset-frontend/coverage" \
+            "${{ env.TAG }}" \
+            npm run test -- --coverage --coverageReporters=json --shard=${{ matrix.shard }}/4
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.shard }}
+          path: coverage/coverage-final.json
+
+  report-coverage:
+    needs: sharded-jest-tests
+    if: ${{ needs.frontend-build.outputs.should-run == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: coverage-artifacts
+      - name: Merge coverage reports
+        run: |
+          mkdir -p coverage
+          npx --yes nyc merge coverage-artifacts coverage/coverage-final.json
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage/coverage-final.json
+          flags: javascript
+          use_oidc: true
+          disable_search: true
+          fail_ci_if_error: false
+
+  lint-frontend:
+    needs: frontend-build
+    if: ${{ needs.frontend-build.outputs.should-run == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download frontend CI image
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+      - name: Load frontend CI image
+        run: zstd -d frontend-build.tar.zst -c | docker load
+      - name: Install dependencies and run frontend static checks
+        run: |
+          docker run --rm \
+            -e CI=true \
+            "${{ env.TAG }}" \
+            sh -c "npm ci && npm run lint:full"
+      - name: Install dependencies, build plugins, and run type checks
+        run: |
+          docker run --rm \
+            -e CI=true \
+            "${{ env.TAG }}" \
+            sh -c "npm ci && npm run plugins:build && npm run type"
+
+  validate-frontend:
+    needs: frontend-build
+    if: ${{ needs.frontend-build.outputs.should-run == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download frontend CI image
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+      - name: Load frontend CI image
+        run: zstd -d frontend-build.tar.zst -c | docker load
+      - name: Build plugin packages
+        run: |
+          docker run --rm \
+            -e CI=true \
+            "${{ env.TAG }}" \
+            npm run plugins:build
+
+  test-storybook:
+    needs: frontend-build
+    if: ${{ needs.frontend-build.outputs.should-run == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download frontend CI image
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+      - name: Load frontend CI image
+        run: zstd -d frontend-build.tar.zst -c | docker load
+      - name: Build Storybook, install Playwright, and run Storybook tests
+        run: |
+          docker run --rm \
+            -e CI=true \
+            "${{ env.TAG }}" \
+            sh -c "npm run build-storybook && npx playwright install --with-deps chromium && npm run test-storybook:ci"
