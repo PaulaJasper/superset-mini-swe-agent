@@ -1,0 +1,275 @@
+# Python integration tests
+name: Python-Integration
+
+# Least-privilege default for GITHUB_TOKEN. Jobs that need more (e.g. OIDC for
+# codecov uploads) opt in via their own job-level `permissions:` block.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - "master"
+      - "[0-9].[0-9]*"
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+
+jobs:
+  changes:
+    name: Detect Python changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      python: ${{ steps.change-detector.outputs.python }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Detect changes
+        id: change-detector
+        uses: ./.github/actions/change-detector
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  test-mysql:
+    name: MySQL integration tests
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: superset
+          MYSQL_USER: superset
+          MYSQL_PASSWORD: superset
+        ports:
+          - "3306:3306"
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+      redis:
+        image: redis:7
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      SUPERSET_CONFIG: tests.integration_tests.superset_test_config
+      SUPERSET_TESTENV: "true"
+      SUPERSET__SQLALCHEMY_DATABASE_URI: mysql+mysqldb://superset:superset@127.0.0.1:3306/superset?charset=utf8mb4
+      SUPERSET__SQLALCHEMY_EXAMPLES_URI: mysql+mysqldb://superset:superset@127.0.0.1:3306/superset?charset=utf8mb4
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python backend
+        uses: ./.github/actions/setup-backend
+        with:
+          python-version: current
+      - name: Start Celery worker
+        run: |
+          nohup celery --app=superset.tasks.celery_app:app worker -O fair -c 2 --loglevel=INFO > celery.log 2>&1 &
+          echo "CELERY_PID=$!" >> "$GITHUB_ENV"
+      - name: Run MySQL integration tests
+        run: ./scripts/python_tests.sh
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          use_oidc: true
+          flags: python,mysql
+          fail_ci_if_error: false
+      - name: Generate database engine diagnostics
+        run: |
+          python - <<'PY'
+          import json
+          from datetime import datetime, timezone
+
+          database_engines = {
+              "mysql": {
+                  "driver": "mysqlclient",
+                  "role": "integration-test-metadata",
+                  "status": "tested",
+              },
+              "postgresql": {
+                  "driver": "psycopg2",
+                  "role": "integration-test-metadata",
+                  "status": "available",
+              },
+              "sqlite": {
+                  "driver": "sqlite3",
+                  "role": "integration-test-metadata",
+                  "status": "available",
+              },
+          }
+          diagnostics = {
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "database_engines": database_engines,
+          }
+          with open("database-engine-diagnostics.json", "w", encoding="utf-8") as output:
+              json.dump(diagnostics, output, indent=2)
+              output.write("\n")
+          PY
+      - name: Upload database engine diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: database-engine-diagnostics-mysql
+          path: database-engine-diagnostics.json
+          if-no-files-found: error
+
+  test-postgres:
+    name: PostgreSQL integration tests (${{ matrix.python-version }})
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["current"]') || fromJSON('["current", "next"]') }}
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: superset
+          POSTGRES_PASSWORD: superset
+          POSTGRES_DB: superset
+        ports:
+          - "5433:5432"
+        options: >-
+          --health-cmd="pg_isready -U superset -d superset"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+      redis:
+        image: redis:7
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      SUPERSET_CONFIG: tests.integration_tests.superset_test_config
+      SUPERSET_TESTENV: "true"
+      SUPERSET__SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://superset:superset@127.0.0.1:5433/superset
+      SUPERSET__SQLALCHEMY_EXAMPLES_URI: postgresql+psycopg2://superset:superset@127.0.0.1:5433/superset
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python backend
+        uses: ./.github/actions/setup-backend
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Start Celery worker
+        run: |
+          nohup celery --app=superset.tasks.celery_app:app worker -O fair -c 2 --loglevel=INFO > celery.log 2>&1 &
+          echo "CELERY_PID=$!" >> "$GITHUB_ENV"
+      - name: Run PostgreSQL integration tests
+        run: ./scripts/python_tests.sh
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          use_oidc: true
+          flags: python,postgres
+          fail_ci_if_error: false
+
+  test-sqlite:
+    name: SQLite integration tests
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      SUPERSET_CONFIG: tests.integration_tests.superset_test_config
+      SUPERSET_TESTENV: "true"
+      SUPERSET__SQLALCHEMY_DATABASE_URI: sqlite:///${{ github.workspace }}/superset.db
+      SUPERSET__SQLALCHEMY_EXAMPLES_URI: sqlite:///${{ github.workspace }}/examples.db
+      SUPERSET_HOME: ${{ runner.temp }}/superset-sqlite
+      UPLOAD_FOLDER: ${{ runner.temp }}/superset-sqlite/uploads
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Create SQLite temporary directories
+        run: mkdir -p "$SUPERSET_HOME" "$UPLOAD_FOLDER"
+      - name: Set up Python backend
+        uses: ./.github/actions/setup-backend
+        with:
+          python-version: current
+      - name: Start Celery worker
+        run: |
+          nohup celery --app=superset.tasks.celery_app:app worker -O fair -c 2 --loglevel=INFO > celery.log 2>&1 &
+          echo "CELERY_PID=$!" >> "$GITHUB_ENV"
+      - name: Run SQLite integration tests
+        run: ./scripts/python_tests.sh
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          use_oidc: true
+          flags: python,sqlite
+          fail_ci_if_error: false
+
+  test-postgres-required:
+    name: PostgreSQL integration test required
+    needs:
+      - changes
+      - test-postgres
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify PostgreSQL integration test result
+        run: |
+          result="${{ needs.test-postgres.result }}"
+          echo "PostgreSQL integration test result: $result"
+          case "$result" in
+            success|skipped)
+              echo "PostgreSQL integration test passed or was skipped"
+              ;;
+            *)
+              echo "PostgreSQL integration test did not succeed: $result" >&2
+              exit 1
+              ;;
+          esac
