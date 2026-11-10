@@ -59,7 +59,7 @@ jobs:
           docker save "${{ env.TAG }}" | zstd -T0 -o frontend-build.tar.zst
       - name: Upload frontend CI image
         if: ${{ steps.check.outputs.frontend }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: frontend-build
           path: frontend-build.tar.zst
@@ -87,7 +87,7 @@ jobs:
             "${{ env.TAG }}" \
             npm run test -- --coverage --coverageReporters=json --shard=${{ matrix.shard }}/4
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-${{ matrix.shard }}
           path: coverage/coverage-final.json
