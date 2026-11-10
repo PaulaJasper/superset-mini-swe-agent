@@ -156,7 +156,7 @@ jobs:
           cypress-run-all "$USE_DASHBOARD" "$APP_ROOT"
       - name: Upload Cypress screenshots
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cypress-screenshots-${{ github.run_id }}-${{ github.job }}-${{ matrix.browser }}-shard-${{ matrix.parallel_id }}-${{ matrix.app_root == '' && 'root' || 'prefixed' }}
           path: superset-frontend/cypress-base/cypress/screenshots
@@ -267,7 +267,7 @@ jobs:
           playwright-run "$APP_ROOT"
       - name: Upload Playwright results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-results-${{ github.run_id }}-${{ github.job }}-${{ matrix.browser }}-${{ matrix.app_root == '' && 'root' || 'prefixed' }}
           path: |
